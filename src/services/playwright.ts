@@ -77,9 +77,28 @@ export class Mutex {
 
 const uiMutex = new Mutex();
 
+function resolvePlaywrightAccountId(accountId?: string): string | undefined {
+  if (accountId) {
+    return accountId;
+  }
+
+  if (activePage) {
+    return undefined;
+  }
+
+  const firstWarmedAccount = accountPages.keys().next();
+  return firstWarmedAccount.done ? undefined : firstWarmedAccount.value;
+}
+
+function resolvePlaywrightPage(accountId?: string): { accountId?: string, page: Page | null } {
+  const resolvedAccountId = resolvePlaywrightAccountId(accountId);
+  const page = resolvedAccountId ? accountPages.get(resolvedAccountId) ?? null : activePage;
+  return { accountId: resolvedAccountId, page };
+}
+
 export async function getCookies(accountId?: string): Promise<string> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return 'token=mock';
-  const page = accountId ? accountPages.get(accountId) : activePage;
+  const { page } = resolvePlaywrightPage(accountId);
   if (!page) return '';
   const cookies = await page.context().cookies();
   return cookies.map(c => `${c.name}=${c.value}`).join('; ');
@@ -88,22 +107,22 @@ export async function getCookies(accountId?: string): Promise<string> {
 export async function getBasicHeaders(accountId?: string): Promise<{ cookie: string, userAgent: string, bxV: string }> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return { cookie: 'token=mock', userAgent: 'mock', bxV: '2.5.36' };
   
-  let page = accountId ? accountPages.get(accountId) : activePage;
+  let { accountId: resolvedAccountId, page } = resolvePlaywrightPage(accountId);
   if (accountId && !page) {
     const { getAccountCredentials } = await import('../core/accounts.ts');
     const creds = getAccountCredentials(accountId);
     if (creds) {
       await initPlaywrightForAccount(creds, config.browser.headless);
-      page = accountPages.get(accountId);
+      ({ accountId: resolvedAccountId, page } = resolvePlaywrightPage(accountId));
     }
   }
   
   if (!page) throw new Error('Playwright not initialized');
   
-  const cookie = await getCookies(accountId);
+  const cookie = await getCookies(resolvedAccountId);
   const userAgent = await page.evaluate(() => navigator.userAgent);
   
-  const cacheKey = accountId || 'global';
+  const cacheKey = resolvedAccountId || 'global';
   const cache = getAccountHeaderCache(cacheKey);
   const bxV = cache.currentHeaders['bx-v'] || '2.5.36';
   
@@ -315,7 +334,8 @@ async function loginToQwenUI(email: string, password: string): Promise<boolean> 
 }
 
 export async function getQwenHeaders(forceNew = false, accountId?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
-  const cacheKey = accountId || 'global';
+  const resolvedAccountId = resolvePlaywrightAccountId(accountId);
+  const cacheKey = resolvedAccountId || 'global';
   const cache = getAccountHeaderCache(cacheKey);
 
   if (!forceNew && cache.cachedQwenHeaders && (Date.now() - cache.lastHeadersTime < HEADERS_TTL * REFRESH_THRESHOLD)) {
@@ -327,14 +347,15 @@ export async function getQwenHeaders(forceNew = false, accountId?: string): Prom
       release();
       return cache.cachedQwenHeaders;
     }
-    return await _getQwenHeadersInternal(forceNew, accountId);
+    return await _getQwenHeadersInternal(forceNew, resolvedAccountId);
   } finally {
     release();
   }
 }
 
 async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: string | null }> {
-  const cacheKey = accountId || 'global';
+  let resolvedAccountId = resolvePlaywrightAccountId(accountId);
+  const cacheKey = resolvedAccountId || 'global';
   const cache = getAccountHeaderCache(cacheKey);
 
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
@@ -356,23 +377,26 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
     if (age > HEADERS_TTL * REFRESH_THRESHOLD && !cache.refreshTimeout) {
       cache.refreshTimeout = setTimeout(() => {
         cache.refreshTimeout = null;
-        getQwenHeaders(true, accountId).catch(() => {});
+        getQwenHeaders(true, resolvedAccountId).catch(() => {});
       }, HEADERS_TTL - age);
     }
     return cache.cachedQwenHeaders;
   }
 
-  if (accountId && !accountPages.has(accountId)) {
+  if (resolvedAccountId && !accountPages.has(resolvedAccountId)) {
     const { getAccountCredentials } = await import('../core/accounts.ts');
-    const creds = getAccountCredentials(accountId);
+    const creds = getAccountCredentials(resolvedAccountId);
     if (creds) {
       await initPlaywrightForAccount(creds, config.browser.headless);
     }
   }
 
-  const page = accountId ? accountPages.get(accountId) : activePage;
+  const resolvedPage = resolvePlaywrightPage(resolvedAccountId);
+  resolvedAccountId = resolvedPage.accountId;
+  const page = resolvedPage.page;
+  const effectiveCacheKey = resolvedAccountId || 'global';
   if (!page) {
-    throw new Error(`Playwright not initialized for account: ${cacheKey}`);
+    throw new Error(`Playwright not initialized for account: ${effectiveCacheKey}`);
   }
 
   const currentUrl = page.url();
@@ -380,13 +404,13 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
   const isOnSpecificChat = isOnQwen && /\/c\//.test(currentUrl);
 
   if (!isOnQwen || forceNew || isOnSpecificChat) {
-    console.log(`[Playwright] Navigating to Qwen home for ${cacheKey}... (Current: ${currentUrl})`);
+    console.log(`[Playwright] Navigating to Qwen home for ${effectiveCacheKey}... (Current: ${currentUrl})`);
     await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded' });
   }
 
   const isLoginPage = page.url().includes('login') || (await page.$('input[type="email"], input[placeholder*="Email"]'));
   if (isLoginPage) {
-    if (!accountId) {
+    if (!resolvedAccountId) {
       const email = process.env.QWEN_EMAIL;
       const password = process.env.QWEN_PASSWORD;
       
@@ -406,10 +430,10 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
       }
     } else {
       const { getAccountCredentials } = await import('../core/accounts.ts');
-      const creds = getAccountCredentials(accountId);
+      const creds = getAccountCredentials(resolvedAccountId);
       if (creds && creds.email && creds.password) {
         console.log(`[Playwright] Detected login page for account ${creds.email}. Attempting login...`);
-        const acctContext = accountContexts.get(accountId);
+        const acctContext = accountContexts.get(resolvedAccountId);
         if (acctContext) {
           await loginToQwenWithContext(acctContext, page, creds.email, creds.password);
         }
@@ -417,7 +441,7 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
     }
   }
 
-  console.log(`[Playwright] Waiting for chat input for ${cacheKey}...`);
+  console.log(`[Playwright] Waiting for chat input for ${effectiveCacheKey}...`);
   const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
   await page.waitForSelector(inputSelector, { timeout: 30000 }).catch(() => {
     console.error(`[Playwright] Chat input not found for ${cacheKey}. Current URL:`, page.url());
